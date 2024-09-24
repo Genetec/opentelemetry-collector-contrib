@@ -49,7 +49,7 @@ func (s *scraper) start(context.Context, component.Host) error {
 		s.settings.Logger.Warn("some performance counters could not be initialized", zap.Error(err))
 	}
 	s.watchers = watchers
-	return nil
+	return err
 }
 
 func (s *scraper) initWatchers() ([]perfCounterMetricWatcher, error) {
