@@ -18,7 +18,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
-	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
@@ -30,8 +30,6 @@ import (
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/loadbalancingexporter/internal/metadata"
 )
-
-var _ resolver = (*k8sResolver)(nil)
 
 var (
 	errNoSvc = errors.New("no service specified to resolve the backends")
@@ -52,10 +50,10 @@ type k8sResolver struct {
 	svcNs   string
 	port    []int32
 
-	handler        *handler
-	once           *sync.Once
-	epsListWatcher cache.ListerWatcher
-	endpointsStore *sync.Map
+	handler             *handler
+	once                *sync.Once
+	epsSliceListWatcher cache.ListerWatcher
+	endpointsStore      *sync.Map
 
 	lwTimeout time.Duration
 
@@ -101,17 +99,17 @@ func newK8sResolver(clt kubernetes.Interface,
 		}
 	}
 
-	epsSelector := fmt.Sprintf("metadata.name=%s", name)
-	epsListWatcher := &cache.ListWatch{
+	epsSliceSelector := fmt.Sprintf("%s=%s", discoveryv1.LabelServiceName, name)
+	epsSliceListWatcher := &cache.ListWatch{
 		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-			options.FieldSelector = epsSelector
+			options.LabelSelector = epsSliceSelector
 			options.TimeoutSeconds = ptr.To[int64](int64(timeout.Seconds()))
-			return clt.CoreV1().Endpoints(namespace).List(context.Background(), options)
+			return clt.DiscoveryV1().EndpointSlices(namespace).List(context.Background(), options)
 		},
 		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-			options.FieldSelector = epsSelector
+			options.LabelSelector = epsSliceSelector
 			options.TimeoutSeconds = ptr.To[int64](int64(timeout.Seconds()))
-			return clt.CoreV1().Endpoints(namespace).Watch(context.Background(), options)
+			return clt.DiscoveryV1().EndpointSlices(namespace).Watch(context.Background(), options)
 		},
 	}
 
@@ -121,20 +119,21 @@ func newK8sResolver(clt kubernetes.Interface,
 		logger:      logger,
 		telemetry:   tb,
 		returnNames: returnNames,
+		hostIPs:     &sync.Map{},
 	}
 	r := &k8sResolver{
-		logger:         logger,
-		svcName:        name,
-		svcNs:          namespace,
-		port:           ports,
-		once:           &sync.Once{},
-		endpointsStore: epsStore,
-		epsListWatcher: epsListWatcher,
-		handler:        h,
-		stopCh:         make(chan struct{}),
-		lwTimeout:      timeout,
-		telemetry:      tb,
-		returnNames:    returnNames,
+		logger:              logger,
+		svcName:             name,
+		svcNs:               namespace,
+		port:                ports,
+		once:                &sync.Once{},
+		endpointsStore:      epsStore,
+		epsSliceListWatcher: epsSliceListWatcher,
+		handler:             h,
+		stopCh:              make(chan struct{}),
+		lwTimeout:           timeout,
+		telemetry:           tb,
+		returnNames:         returnNames,
 	}
 	h.callback = r.resolve
 
@@ -144,15 +143,15 @@ func newK8sResolver(clt kubernetes.Interface,
 func (r *k8sResolver) start(_ context.Context) error {
 	var initErr error
 	r.once.Do(func() {
-		if r.epsListWatcher != nil {
-			r.logger.Debug("creating and starting endpoints informer")
-			epsInformer := cache.NewSharedInformer(r.epsListWatcher, &corev1.Endpoints{}, 0)
-			if _, err := epsInformer.AddEventHandler(r.handler); err != nil {
-				r.logger.Error("unable to start watching for changes to the specified service names", zap.Error(err))
+		if r.epsSliceListWatcher != nil {
+			r.logger.Debug("creating and starting EndpointSlice informer")
+			epsSliceInformer := cache.NewSharedInformer(r.epsSliceListWatcher, &discoveryv1.EndpointSlice{}, 0)
+			if _, err := epsSliceInformer.AddEventHandler(r.handler); err != nil {
+				r.logger.Error("unable to start watching for changes to the specified service (EndpointSlices)", zap.Error(err))
 			}
-			go epsInformer.Run(r.stopCh)
-			if !cache.WaitForCacheSync(r.stopCh, epsInformer.HasSynced) {
-				initErr = errors.New("endpoints informer not sync")
+			go epsSliceInformer.Run(r.stopCh)
+			if !cache.WaitForCacheSync(r.stopCh, epsSliceInformer.HasSynced) {
+				initErr = errors.New("endpointslice informer not synced")
 			}
 		}
 	})

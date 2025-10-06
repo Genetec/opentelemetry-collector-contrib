@@ -7,85 +7,73 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+func ptrTo(s string) *string { return &s }
+
 func TestConvertToEndpoints(tst *testing.T) {
-	// Create dummy Endpoints objects
-	endpoints1 := &corev1.Endpoints{
+	// Create dummy EndpointSlice objects
+	endpoints1 := &discoveryv1.EndpointSlice{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-endpoints-1",
+			Name:      "test-slice-1",
 			Namespace: "test-namespace",
+			Labels:    map[string]string{discoveryv1.LabelServiceName: "svc"},
 		},
-		Subsets: []corev1.EndpointSubset{
-			{
-				Addresses: []corev1.EndpointAddress{
-					{
-						Hostname: "pod-1",
-						IP:       "192.168.10.101",
-					},
-				},
-			},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Endpoints: []discoveryv1.Endpoint{
+			{Addresses: []string{"192.168.10.101"}, Hostname: ptrTo("pod-1")},
 		},
 	}
-	endpoints2 := &corev1.Endpoints{
+	endpoints2 := &discoveryv1.EndpointSlice{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-endpoints-2",
+			Name:      "test-slice-2",
 			Namespace: "test-namespace",
+			Labels:    map[string]string{discoveryv1.LabelServiceName: "svc"},
 		},
-		Subsets: []corev1.EndpointSubset{
-			{
-				Addresses: []corev1.EndpointAddress{
-					{
-						Hostname: "pod-2",
-						IP:       "192.168.10.102",
-					},
-				},
-			},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Endpoints: []discoveryv1.Endpoint{
+			{Addresses: []string{"192.168.10.102"}, Hostname: ptrTo("pod-2")},
 		},
 	}
-	endpoints3 := &corev1.Endpoints{
+	endpoints3 := &discoveryv1.EndpointSlice{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-endpoints-3",
+			Name:      "test-slice-3",
 			Namespace: "test-namespace",
+			Labels:    map[string]string{discoveryv1.LabelServiceName: "svc"},
 		},
-		Subsets: []corev1.EndpointSubset{
-			{
-				Addresses: []corev1.EndpointAddress{
-					{
-						IP: "192.168.10.103",
-					},
-				},
-			},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Endpoints: []discoveryv1.Endpoint{
+			{Addresses: []string{"192.168.10.103"}},
 		},
 	}
 
 	tests := []struct {
 		name              string
 		returnNames       bool
-		includedEndpoints []*corev1.Endpoints
-		expectedEndpoints map[string]bool
+		includedEndpoints []*discoveryv1.EndpointSlice
+		expectedEndpoints map[string]string
 		wantNil           bool
 	}{
 		{
 			name:              "return hostnames",
 			returnNames:       true,
-			includedEndpoints: []*corev1.Endpoints{endpoints1, endpoints2},
-			expectedEndpoints: map[string]bool{"pod-1": true, "pod-2": true},
+			includedEndpoints: []*discoveryv1.EndpointSlice{endpoints1, endpoints2},
+			expectedEndpoints: map[string]string{"pod-1": "192.168.10.101", "pod-2": "192.168.10.102"},
 			wantNil:           false,
 		},
 		{
 			name:              "return IPs",
 			returnNames:       false,
-			includedEndpoints: []*corev1.Endpoints{endpoints1, endpoints2, endpoints3},
-			expectedEndpoints: map[string]bool{"192.168.10.101": true, "192.168.10.102": true, "192.168.10.103": true},
+			includedEndpoints: []*discoveryv1.EndpointSlice{endpoints1, endpoints2, endpoints3},
+			expectedEndpoints: map[string]string{"192.168.10.101": "", "192.168.10.102": "", "192.168.10.103": ""},
 			wantNil:           false,
 		},
 		{
 			name:              "missing hostname",
 			returnNames:       true,
-			includedEndpoints: []*corev1.Endpoints{endpoints1, endpoints3},
+			includedEndpoints: []*discoveryv1.EndpointSlice{endpoints1, endpoints3},
 			expectedEndpoints: nil,
 			wantNil:           true,
 		},
@@ -102,4 +90,30 @@ func TestConvertToEndpoints(tst *testing.T) {
 			assert.Equal(tst, !tt.wantNil, ok)
 		})
 	}
+}
+
+func TestConvertToEndpoints_ConditionsFiltering(t *testing.T) {
+	boolPtr := func(b bool) *bool { return &b }
+
+	// Endpoints with various readiness/serving combinations
+	epReady := discoveryv1.Endpoint{Addresses: []string{"10.0.0.1"}, Hostname: ptrTo("pod-ready"), Conditions: discoveryv1.EndpointConditions{Ready: boolPtr(true)}}
+	epNotReady := discoveryv1.Endpoint{Addresses: []string{"10.0.0.2"}, Hostname: ptrTo("pod-notready"), Conditions: discoveryv1.EndpointConditions{Ready: boolPtr(false)}}
+	epServingFalse := discoveryv1.Endpoint{Addresses: []string{"10.0.0.4"}, Hostname: ptrTo("pod-serving-false"), Conditions: discoveryv1.EndpointConditions{Ready: boolPtr(true), Serving: boolPtr(false)}}
+	epNilConditions := discoveryv1.Endpoint{Addresses: []string{"10.0.0.3"}, Hostname: ptrTo("pod-nil")}
+
+	slice := &discoveryv1.EndpointSlice{
+		ObjectMeta:  metav1.ObjectMeta{Name: "svc-slice", Namespace: "ns", Labels: map[string]string{"kubernetes.io/service-name": "svc"}},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Endpoints:   []discoveryv1.Endpoint{epReady, epNotReady, epNilConditions, epServingFalse},
+	}
+
+	// returnNames=false (IP mode): expect only ready & nilConditions IPs
+	ok, res := convertToEndpoints(false, slice)
+	assert.True(t, ok)
+	assert.Equal(t, map[string]string{"10.0.0.1": "", "10.0.0.3": ""}, res)
+
+	// returnNames=true (hostname mode): expect only hostnames for ready & nilConditions endpoints
+	ok, res = convertToEndpoints(true, slice)
+	assert.True(t, ok)
+	assert.Equal(t, map[string]string{"pod-ready": "10.0.0.1", "pod-nil": "10.0.0.3"}, res)
 }

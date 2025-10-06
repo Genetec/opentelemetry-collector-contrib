@@ -9,7 +9,7 @@ import (
 
 	"go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
-	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/client-go/tools/cache"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/loadbalancingexporter/internal/metadata"
@@ -18,7 +18,7 @@ import (
 var _ cache.ResourceEventHandler = (*handler)(nil)
 
 const (
-	epMissingHostnamesMsg = "Endpoints object missing hostnames"
+	epMissingHostnamesMsg = "EndpointSlice object missing hostnames"
 )
 
 type handler struct {
@@ -27,94 +27,113 @@ type handler struct {
 	logger      *zap.Logger
 	telemetry   *metadata.TelemetryBuilder
 	returnNames bool
+	// hostIPs keeps track of current IP for a hostname when returnNames is true so we can detect IP changes.
+	hostIPs *sync.Map
 }
 
 func (h handler) OnAdd(obj any, _ bool) {
-	var endpoints map[string]bool
+	var endpoints map[string]string
 	var ok bool
 
 	switch object := obj.(type) {
-	case *corev1.Endpoints:
+	case *discoveryv1.EndpointSlice:
 		ok, endpoints = convertToEndpoints(h.returnNames, object)
 		if !ok {
 			h.logger.Warn(epMissingHostnamesMsg, zap.Any("obj", obj))
 			h.telemetry.LoadbalancerNumResolutions.Add(context.Background(), 1, metric.WithAttributeSet(k8sResolverFailureAttrSet))
 			return
 		}
-
-	default: // unsupported
-		h.logger.Warn("Got an unexpected Kubernetes data type during the inclusion of a new pods for the service", zap.Any("obj", obj))
+	default:
+		h.logger.Warn("Got an unexpected Kubernetes data type during inclusion", zap.Any("obj", obj))
 		h.telemetry.LoadbalancerNumResolutions.Add(context.Background(), 1, metric.WithAttributeSet(k8sResolverFailureAttrSet))
 		return
 	}
+	// Track whether we saw at least one brand new endpoint.
 	changed := false
-	for ep := range endpoints {
-		if _, loaded := h.endpoints.LoadOrStore(ep, true); !loaded {
+	for ep, ip := range endpoints {
+		if _, present := h.endpoints.Load(ep); !present {
+			h.endpoints.Store(ep, true)
 			changed = true
+		}
+		if h.returnNames && h.hostIPs != nil {
+			h.hostIPs.Store(ep, ip)
 		}
 	}
 	if changed {
 		_, _ = h.callback(context.Background())
+	} else {
+		h.logger.Debug("OnAdd received slice but no new endpoints detected")
 	}
 }
 
 func (h handler) OnUpdate(oldObj, newObj any) {
-	switch oldEps := oldObj.(type) {
-	case *corev1.Endpoints:
-		newEps, ok := newObj.(*corev1.Endpoints)
+	switch oldSlice := oldObj.(type) {
+	case *discoveryv1.EndpointSlice:
+		newSlice, ok := newObj.(*discoveryv1.EndpointSlice)
 		if !ok {
-			h.logger.Warn("Got an unexpected Kubernetes data type during the update of the pods for a service", zap.Any("obj", newObj))
+			h.logger.Warn("Unexpected Kubernetes data type during update", zap.Any("obj", newObj))
 			h.telemetry.LoadbalancerNumResolutions.Add(context.Background(), 1, metric.WithAttributeSet(k8sResolverFailureAttrSet))
 			return
 		}
-
-		_, oldEndpoints := convertToEndpoints(h.returnNames, oldEps)
-		hostnameOk, newEndpoints := convertToEndpoints(h.returnNames, newEps)
+		_, oldEndpoints := convertToEndpoints(h.returnNames, oldSlice)
+		hostnameOk, newEndpoints := convertToEndpoints(h.returnNames, newSlice)
 		if !hostnameOk {
-			h.logger.Warn(epMissingHostnamesMsg, zap.Any("obj", newEps))
+			h.logger.Warn(epMissingHostnamesMsg, zap.Any("obj", newSlice))
 			h.telemetry.LoadbalancerNumResolutions.Add(context.Background(), 1, metric.WithAttributeSet(k8sResolverFailureAttrSet))
 			return
 		}
-
 		changed := false
-
-		// Iterate through old endpoints and remove those that are not in the new list.
+		if h.returnNames && h.hostIPs != nil {
+			for host, oldIP := range oldEndpoints {
+				if newIP, ok := newEndpoints[host]; ok && newIP != oldIP {
+					h.logger.Debug("Detected IP change for hostname", zap.String("hostname", host), zap.String("old_ip", oldIP), zap.String("new_ip", newIP))
+					h.endpoints.Delete(host)
+					h.hostIPs.Delete(host)
+					_, _ = h.callback(context.Background())
+					changed = true
+				}
+			}
+		}
+		// For IP mode we need to detect replacement of IPs (addresses changed entirely).
 		for ep := range oldEndpoints {
 			if _, ok := newEndpoints[ep]; !ok {
 				h.endpoints.Delete(ep)
+				if h.returnNames && h.hostIPs != nil {
+					h.hostIPs.Delete(ep)
+				}
 				changed = true
 			}
 		}
-
-		// Iterate through new endpoints and add those that are not in the endpoints map already.
-		for ep := range newEndpoints {
-			if _, loaded := h.endpoints.LoadOrStore(ep, true); !loaded {
+		for ep, ip := range newEndpoints {
+			if _, present := h.endpoints.Load(ep); !present {
+				h.endpoints.Store(ep, true)
 				changed = true
 			}
+			if h.returnNames && h.hostIPs != nil {
+				h.hostIPs.Store(ep, ip)
+			}
 		}
-
 		if changed {
 			_, _ = h.callback(context.Background())
 		} else {
-			h.logger.Debug("No changes detected in the endpoints for the service", zap.Any("old", oldEps), zap.Any("new", newEps))
+			h.logger.Debug("No changes detected in EndpointSlice", zap.Any("old", oldSlice), zap.Any("new", newSlice))
 		}
-
-	default: // unsupported
-		h.logger.Warn("Got an unexpected Kubernetes data type during the update of the pods for a service", zap.Any("obj", oldObj))
+	default:
+		h.logger.Warn("Unexpected Kubernetes data type during update", zap.Any("obj", oldObj))
 		h.telemetry.LoadbalancerNumResolutions.Add(context.Background(), 1, metric.WithAttributeSet(k8sResolverFailureAttrSet))
 		return
 	}
 }
 
 func (h handler) OnDelete(obj any) {
-	var endpoints map[string]bool
+	var endpoints map[string]string
 	var ok bool
 
 	switch object := obj.(type) {
 	case *cache.DeletedFinalStateUnknown:
 		h.OnDelete(object.Obj)
 		return
-	case *corev1.Endpoints:
+	case *discoveryv1.EndpointSlice:
 		if object != nil {
 			ok, endpoints = convertToEndpoints(h.returnNames, object)
 			if !ok {
@@ -123,31 +142,43 @@ func (h handler) OnDelete(obj any) {
 				return
 			}
 		}
-	default: // unsupported
-		h.logger.Warn("Got an unexpected Kubernetes data type during the removal of the pods for a service", zap.Any("obj", obj))
+	default:
+		h.logger.Warn("Unexpected Kubernetes data type during removal", zap.Any("obj", obj))
 		h.telemetry.LoadbalancerNumResolutions.Add(context.Background(), 1, metric.WithAttributeSet(k8sResolverFailureAttrSet))
 		return
 	}
 	if len(endpoints) != 0 {
 		for endpoint := range endpoints {
 			h.endpoints.Delete(endpoint)
+			if h.returnNames && h.hostIPs != nil {
+				h.hostIPs.Delete(endpoint)
+			}
 		}
 		_, _ = h.callback(context.Background())
 	}
 }
 
-func convertToEndpoints(retNames bool, eps ...*corev1.Endpoints) (bool, map[string]bool) {
-	res := map[string]bool{}
-	for _, ep := range eps {
-		for _, subsets := range ep.Subsets {
-			for _, addr := range subsets.Addresses {
+func convertToEndpoints(retNames bool, slices ...*discoveryv1.EndpointSlice) (bool, map[string]string) {
+	res := map[string]string{}
+	for _, es := range slices {
+		for _, ep := range es.Endpoints {
+			// Skip endpoints explicitly marked not ready or not serving. If fields are nil, treat as ready.
+			if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
+				continue
+			}
+			if ep.Conditions.Serving != nil && !*ep.Conditions.Serving {
+				continue
+			}
+			// Each Endpoint may have multiple addresses
+			for _, addr := range ep.Addresses {
 				if retNames {
-					if addr.Hostname == "" {
+					// Hostname field is under EndpointSlice Endpoint
+					if ep.Hostname == nil || *ep.Hostname == "" {
 						return false, nil
 					}
-					res[addr.Hostname] = true
+					res[*ep.Hostname] = addr
 				} else {
-					res[addr.IP] = true
+					res[addr] = ""
 				}
 			}
 		}
